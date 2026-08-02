@@ -59,49 +59,90 @@ const LocateControl = L.Control.extend({
 });
 map.addControl(new LocateControl());
 
+function showPosition(pos, recenter) {
+  const { latitude, longitude, accuracy } = pos.coords;
+
+  locationLayer.clearLayers();
+  L.circle([latitude, longitude], {
+    radius: Math.max(accuracy, 30),
+    color: "#2f9dff",
+    weight: 1,
+    fillColor: "#2f9dff",
+    fillOpacity: 0.12,
+  }).addTo(locationLayer);
+  L.circleMarker([latitude, longitude], {
+    radius: 7,
+    color: "#ffffff",
+    weight: 2,
+    fillColor: "#2f9dff",
+    fillOpacity: 1,
+  })
+    .bindTooltip("You are here")
+    .addTo(locationLayer);
+
+  if (recenter) {
+    // setView fires moveend, which reloads aircraft for the new area
+    map.setView([latitude, longitude], Math.max(map.getZoom(), 8));
+  }
+}
+
+const LOCATE_WINDOW_MS = 25000; // keep refining fixes for up to this long
+const LOCATE_GOOD_ACCURACY_M = 100; // stop early once this accurate
+
 function locateMe(btn) {
   if (!("geolocation" in navigator)) {
     setStatusNote("Geolocation is not supported by this browser.", true);
     return;
   }
   btn.classList.add("locating");
-  navigator.geolocation.getCurrentPosition(
-    (pos) => {
-      btn.classList.remove("locating");
-      const { latitude, longitude, accuracy } = pos.coords;
 
-      locationLayer.clearLayers();
-      L.circle([latitude, longitude], {
-        radius: Math.max(accuracy, 30),
-        color: "#2f9dff",
-        weight: 1,
-        fillColor: "#2f9dff",
-        fillOpacity: 0.12,
-      }).addTo(locationLayer);
-      L.circleMarker([latitude, longitude], {
-        radius: 7,
-        color: "#ffffff",
-        weight: 2,
-        fillColor: "#2f9dff",
-        fillOpacity: 1,
-      })
-        .bindTooltip("You are here")
-        .addTo(locationLayer);
+  let best = null;
+  let finished = false;
+  let watchId = null;
 
-      // setView fires moveend, which reloads aircraft for the new area
-      map.setView([latitude, longitude], Math.max(map.getZoom(), 8));
-      setStatusNote(null);
-    },
-    (err) => {
-      btn.classList.remove("locating");
+  const finish = (err) => {
+    if (finished) return;
+    finished = true;
+    if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+    clearTimeout(giveUpTimer);
+    btn.classList.remove("locating");
+    if (best) {
+      const acc = best.coords.accuracy;
+      setStatusNote(
+        acc > 1000
+          ? `Position found (accurate to ~${(acc / 1000).toFixed(1)} km) — tap the locate button again to refine.`
+          : null
+      );
+    } else {
       const reasons = {
         1: "location permission denied — allow it in your browser settings",
         2: "position unavailable",
-        3: "timed out getting a GPS fix",
+        3: "timed out waiting for a fix — try again outdoors or check that location is enabled for your browser",
       };
-      setStatusNote(`Could not get your position: ${reasons[err.code] || err.message}.`, true);
+      setStatusNote(`Could not get your position: ${reasons[err?.code] || err?.message || "no fix"}.`, true);
+    }
+  };
+
+  const giveUpTimer = setTimeout(() => finish({ code: 3 }), LOCATE_WINDOW_MS);
+
+  // Accept the first fix we can get — even a coarse network-based or cached
+  // one — center the map on it immediately, then keep watching so the marker
+  // tightens as better fixes arrive. Stop early once accuracy is good.
+  watchId = navigator.geolocation.watchPosition(
+    (pos) => {
+      const isFirst = !best;
+      if (isFirst || pos.coords.accuracy < best.coords.accuracy) {
+        best = pos;
+        showPosition(pos, isFirst);
+      }
+      if (pos.coords.accuracy <= LOCATE_GOOD_ACCURACY_M) finish();
     },
-    { enableHighAccuracy: true, timeout: 15000, maximumAge: 60000 }
+    (err) => {
+      // only fatal if we never got any fix at all
+      if (!best) finish(err);
+      else finish();
+    },
+    { enableHighAccuracy: true, maximumAge: 300000, timeout: LOCATE_WINDOW_MS }
   );
 }
 
