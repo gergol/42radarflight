@@ -373,7 +373,15 @@ async function fetchAircraft() {
     }
     const last = trail[trail.length - 1];
     if (!last || last.lat !== ac.lat || last.lon !== ac.lon) {
-      trail.push({ lat: ac.lat, lon: ac.lon, ts: now });
+      const altVal =
+        ac.alt_baro === "ground"
+          ? 0
+          : Number.isFinite(ac.alt_baro)
+            ? ac.alt_baro
+            : Number.isFinite(ac.alt_geom)
+              ? ac.alt_geom
+              : null;
+      trail.push({ lat: ac.lat, lon: ac.lon, ts: now, alt: altVal });
       if (trail.length > TRAIL_MAX_POINTS) trail.splice(0, trail.length - TRAIL_MAX_POINTS);
     }
   }
@@ -755,21 +763,70 @@ function renderDetail() {
     html += `<div class="route-box">Looking up route…</div>`;
   }
 
-  html += `<div class="trail-note" id="trail-note"></div>`;
+  html += `
+    <div class="alt-legend">
+      <span>0 ft</span>
+      <div class="alt-bar"></div>
+      <span>40,000+ ft</span>
+    </div>
+    <div class="trail-note" id="trail-note"></div>`;
   ui.detailBody.innerHTML = html;
   ui.detailPanel.classList.remove("hidden");
 }
 
 // --- track drawing ---------------------------------------------------------
+//
+// Full history is fetched from adsb.lol's tar1090 trace endpoint (positions
+// since UTC midnight, i.e. the whole current flight), with OpenSky's track
+// API and the locally collected session trail as fallbacks. The line is
+// drawn FlightRadar24-style: segments colored by altitude.
+
+const TRACK_REFRESH_MS = 30000; // re-fetch history for the selected plane
+const TRACK_MAX_DRAW_POINTS = 1500;
 
 let trackFetchToken = 0;
+const trackState = { hex: null, fetchedAt: 0, points: [], source: null };
 
-async function drawTrack(hex) {
-  const token = ++trackFetchToken;
-  let points = null;
-  let source = null;
+function altColor(alt) {
+  if (!Number.isFinite(alt)) return "#9aa7b5"; // unknown -> gray
+  const a = Math.max(0, Math.min(alt, 40000));
+  const hue = 50 + (a / 40000) * 250; // yellow (ground) -> magenta (FL400+)
+  return `hsl(${Math.round(hue)}, 85%, 55%)`;
+}
 
-  // 1) try OpenSky's track-so-far endpoint (full trip since takeoff)
+function altBucket(alt) {
+  return Number.isFinite(alt) ? Math.round(alt / 2000) : -1;
+}
+
+/** Parse a tar1090-style trace file (adsb.lol /v0/trace/{icao}). */
+function parseTar1090Trace(data) {
+  const arr = data.trace || data.full?.trace || data.recent?.trace || [];
+  const points = [];
+  let lastAlt = null;
+  for (const p of arr) {
+    if (!Number.isFinite(p[1]) || !Number.isFinite(p[2])) continue;
+    let alt = p[3];
+    if (alt === "ground") alt = 0;
+    if (!Number.isFinite(alt)) alt = lastAlt;
+    else lastAlt = alt;
+    points.push({ lat: p[1], lon: p[2], alt });
+  }
+  return points;
+}
+
+async function fetchTrackPoints(hex) {
+  // 1) adsb.lol trace: full history since UTC midnight, includes altitude
+  try {
+    const res = await fetch(`https://api.adsb.lol/v0/trace/${hex.toLowerCase()}`, fetchOpts());
+    if (res.ok) {
+      const points = parseTar1090Trace(await res.json());
+      if (points.length >= 2) return { points, source: "adsb.lol flight history" };
+    }
+  } catch {
+    /* fall through */
+  }
+
+  // 2) OpenSky track-so-far (altitude in metres)
   try {
     const res = await fetch(
       `https://opensky-network.org/api/tracks/all?icao24=${hex.toLowerCase()}&time=0`,
@@ -777,49 +834,111 @@ async function drawTrack(hex) {
     );
     if (res.ok) {
       const data = await res.json();
-      const path = (data.path || [])
+      const points = (data.path || [])
         .filter((p) => Number.isFinite(p[1]) && Number.isFinite(p[2]))
-        .map((p) => [p[1], p[2]]);
-      if (path.length >= 2) {
-        points = path;
-        source = "OpenSky Network (full track since takeoff)";
-      }
+        .map((p) => ({
+          lat: p[1],
+          lon: p[2],
+          alt: Number.isFinite(p[3]) ? p[3] * 3.28084 : null,
+        }));
+      if (points.length >= 2) return { points, source: "OpenSky Network" };
     }
   } catch {
-    /* CORS/rate-limit/offline — fall through to session trail */
+    /* fall through */
   }
 
-  // 2) fallback: trail accumulated while this page has been open
-  if (!points) {
-    const trail = state.trails.get(hex) || [];
-    if (trail.length >= 2) {
-      points = trail.map((p) => [p.lat, p.lon]);
-      source = "positions collected this session (OpenSky track unavailable)";
-    }
+  // 3) trail accumulated while this page has been open
+  const trail = state.trails.get(hex) || [];
+  if (trail.length >= 2) {
+    return {
+      points: trail.map((p) => ({ lat: p.lat, lon: p.lon, alt: p.alt })),
+      source: "this session only (history sources unavailable)",
+    };
   }
+  return { points: [], source: null };
+}
 
+async function drawTrack(hex) {
+  const token = ++trackFetchToken;
+  const { points, source } = await fetchTrackPoints(hex);
   if (token !== trackFetchToken || hex !== state.selectedHex) return; // superseded
 
+  trackState.hex = hex;
+  trackState.fetchedAt = Date.now();
+  trackState.points = points;
+  trackState.source = source;
+  renderTrackLayers();
+}
+
+/** Draw the stored track as altitude-colored segments plus a live connector. */
+function renderTrackLayers() {
   trackLayer.clearLayers();
-  if (points) {
-    L.polyline(points, { color: "#f5a623", weight: 3, opacity: 0.85 }).addTo(trackLayer);
-    L.polyline(points, { color: "#7a4d00", weight: 5, opacity: 0.25 }).addTo(trackLayer);
+  let pts = trackState.points;
+
+  if (pts.length >= 2) {
+    // decimate very long traces, but always keep the newest point
+    if (pts.length > TRACK_MAX_DRAW_POINTS) {
+      const step = Math.ceil(pts.length / TRACK_MAX_DRAW_POINTS);
+      const sampled = pts.filter((_, i) => i % step === 0);
+      if (sampled[sampled.length - 1] !== pts[pts.length - 1]) sampled.push(pts[pts.length - 1]);
+      pts = sampled;
+    }
+
+    // group consecutive points into segments per 2000 ft altitude band
+    let seg = [pts[0]];
+    let bucket = altBucket(pts[0].alt);
+    const flush = () => {
+      if (seg.length >= 2) {
+        L.polyline(
+          seg.map((p) => [p.lat, p.lon]),
+          { color: altColor(seg[Math.floor(seg.length / 2)].alt), weight: 3, opacity: 0.9 }
+        ).addTo(trackLayer);
+      }
+    };
+    for (let i = 1; i < pts.length; i++) {
+      const p = pts[i];
+      seg.push(p);
+      const b = altBucket(p.alt);
+      if (b !== bucket) {
+        flush();
+        seg = [p];
+        bucket = b;
+      }
+    }
+    flush();
+  }
+
+  // connector from the last history point to the live position
+  const ac = state.aircraft.get(trackState.hex);
+  if (ac && pts.length >= 1) {
+    const lastPt = pts[pts.length - 1];
+    const liveAlt = ac.alt_baro === "ground" ? 0 : ac.alt_baro;
+    L.polyline(
+      [
+        [lastPt.lat, lastPt.lon],
+        [ac.lat, ac.lon],
+      ],
+      { color: altColor(liveAlt), weight: 3, opacity: 0.9 }
+    ).addTo(trackLayer);
   }
 
   const note = document.getElementById("trail-note");
   if (note) {
-    note.textContent = points
-      ? `Track: ${points.length} points — source: ${source}`
-      : "No track available yet — it will build up as positions arrive.";
+    note.textContent =
+      trackState.points.length >= 2
+        ? `Track: ${trackState.points.length} points — source: ${trackState.source}`
+        : "No track available yet — it will build up as positions arrive.";
   }
 }
 
-/** Keep the selected plane's live trail growing without re-hitting OpenSky. */
+/** Called on every data refresh while a plane is selected. */
 function updateSelectedTrackLine() {
-  // If the OpenSky fetch already drew a full track, leave it; otherwise
-  // redraw the session trail so it extends with each refresh.
-  const layers = trackLayer.getLayers();
-  if (layers.length === 0) drawTrack(state.selectedHex);
+  if (trackState.hex !== state.selectedHex) return; // drawTrack in flight
+  if (Date.now() - trackState.fetchedAt > TRACK_REFRESH_MS) {
+    drawTrack(state.selectedHex); // periodic history re-fetch
+  } else {
+    renderTrackLayers(); // just extend the live connector
+  }
 }
 
 // ---------------------------------------------------------------------------
