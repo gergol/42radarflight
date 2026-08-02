@@ -7,7 +7,6 @@
   --muted: #93a3b8;
   --accent: #2f9dff;
   --accent-2: #f5a623;
-  --sidebar-w: 340px;
 }
 
 * { box-sizing: border-box; }
@@ -23,46 +22,71 @@ html, body {
 
 #map {
   position: absolute;
-  top: 0;
-  bottom: 0;
-  left: var(--sidebar-w);
-  right: 0;
+  inset: 0;
   background: #0d1420;
 }
 
-#sidebar {
+/* --- floating action buttons (top right) --------------------------------- */
+
+.fab-stack {
   position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  width: var(--sidebar-w);
+  top: 10px;
+  right: 10px;
   display: flex;
   flex-direction: column;
+  gap: 8px;
+  z-index: 1100;
+}
+
+.fab {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
   background: var(--panel);
-  border-right: 1px solid var(--border);
+  color: var(--text);
+  font-size: 19px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+}
+
+.fab:hover, .fab.active { border-color: var(--accent); }
+
+/* --- floating panels (filters / settings) -------------------------------- */
+
+.float-panel {
+  position: absolute;
+  top: 10px;
+  right: 60px;
+  width: 310px;
+  max-width: calc(100vw - 72px);
+  max-height: min(75vh, calc(100% - 20px));
   overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  z-index: 1090;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.55);
 }
 
-#sidebar header {
-  padding: 14px 16px 8px;
+.float-panel.hidden { display: none; }
+
+.float-panel h2 {
+  margin: 0 0 10px;
+  font-size: 15px;
 }
 
-#sidebar h1 {
-  margin: 0;
-  font-size: 20px;
-  letter-spacing: 0.5px;
-}
-
-.subtitle {
-  margin: 2px 0 0;
+.float-panel h3 {
+  margin: 14px 0 4px;
   font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
   color: var(--muted);
 }
 
-.controls {
-  padding: 8px 16px 12px;
-  border-bottom: 1px solid var(--border);
-}
+/* --- form controls -------------------------------------------------------- */
 
 .control-row {
   margin-bottom: 10px;
@@ -90,19 +114,12 @@ html, body {
 }
 
 .control-row input:focus,
-.control-row select:focus {
-  border-color: var(--accent);
-}
+.control-row select:focus { border-color: var(--accent); }
 
-.row-inline {
-  display: flex;
-  gap: 6px;
-}
-
+.row-inline { display: flex; gap: 6px; }
 .row-inline input { flex: 1; min-width: 0; }
 
-.row-inline button,
-#flight-search-btn {
+.row-inline button {
   background: var(--accent);
   border: none;
   color: #fff;
@@ -124,37 +141,46 @@ html, body {
   cursor: pointer;
 }
 
-#clear-filters:hover {
-  color: var(--text);
-  border-color: var(--accent);
-}
+#clear-filters:hover { color: var(--text); border-color: var(--accent); }
 
 .hint {
   font-size: 11px;
   color: var(--muted);
   margin: 8px 0 0;
+  line-height: 1.45;
+}
+
+.hint a { color: var(--accent); }
+.hint.warn, .warn { color: var(--accent-2); }
+
+/* --- status pill (bottom left) -------------------------------------------- */
+
+.status-pill {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  max-width: min(75vw, 420px);
+  background: rgba(24, 33, 47, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  z-index: 1080;
   line-height: 1.4;
 }
 
-.status {
-  padding: 8px 16px;
-  font-size: 12px;
-  color: var(--muted);
-  border-bottom: 1px solid var(--border);
-  min-height: 34px;
-}
-
-.status .warn { color: var(--accent-2); }
+/* --- plane list (inside filters panel) ------------------------------------ */
 
 .plane-list {
-  flex: 1;
+  max-height: 300px;
   overflow-y: auto;
-  min-height: 80px;
+  margin: 0 -14px;
 }
 
 .plane-row {
-  padding: 9px 16px;
-  border-bottom: 1px solid var(--border);
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
   cursor: pointer;
   display: flex;
   justify-content: space-between;
@@ -163,43 +189,58 @@ html, body {
 }
 
 .plane-row:hover { background: var(--panel-2); }
-.plane-row.selected { background: #223349; border-left: 3px solid var(--accent-2); padding-left: 13px; }
+.plane-row.selected { background: #223349; border-left: 3px solid var(--accent-2); padding-left: 11px; }
 
-.plane-row .cs { font-weight: 600; font-size: 14px; }
+.plane-row .cs { font-weight: 600; font-size: 13px; }
 .plane-row .cs.clickable { color: var(--accent); text-decoration: underline dotted; cursor: pointer; }
 .plane-row .type { color: var(--accent); font-size: 12px; }
 .plane-row .route { color: var(--muted); font-size: 11px; white-space: nowrap; }
 
-.detail-panel {
-  border-top: 2px solid var(--accent);
-  background: var(--panel-2);
-  padding: 0 16px 12px;
-  max-height: 46%;
+/* --- overlay panels: flight schedule + aircraft details ------------------- */
+
+.overlay-panel {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  width: 350px;
+  max-width: calc(100vw - 20px);
+  max-height: 62vh;
   overflow-y: auto;
-  flex-shrink: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-top: 2px solid var(--accent);
+  border-radius: 12px;
+  padding: 0 14px 12px;
+  z-index: 1050;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.55);
 }
 
-.detail-panel.hidden { display: none; }
+#flight-panel { z-index: 1060; }
+
+.overlay-panel.hidden { display: none; }
 
 .detail-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
   padding: 10px 0 4px;
+  position: sticky;
+  top: 0;
+  background: var(--panel-2);
 }
 
-.detail-header h2 { margin: 0; font-size: 18px; }
+.detail-header h2 { margin: 0; font-size: 17px; }
 
-#detail-close {
+#detail-close, #flight-close {
   background: none;
   border: none;
   color: var(--muted);
-  font-size: 20px;
+  font-size: 22px;
   cursor: pointer;
   line-height: 1;
 }
 
-#detail-close:hover { color: var(--text); }
+#detail-close:hover, #flight-close:hover { color: var(--text); }
 
 .detail-grid {
   display: grid;
@@ -234,7 +275,8 @@ html, body {
   color: var(--accent);
 }
 
-/* flight schedule panel */
+/* --- flight schedule panel ------------------------------------------------ */
+
 .flight-airline { margin: 6px 0 0; font-size: 13px; color: var(--muted); }
 
 .live-row {
@@ -319,9 +361,7 @@ html, body {
   margin: 6px 0;
 }
 
-.hint.warn, .status .warn { color: var(--accent-2); }
-
-.hint a { color: var(--accent); }
+/* --- altitude legend ------------------------------------------------------- */
 
 .alt-legend {
   display: flex;
@@ -354,16 +394,8 @@ html, body {
   color: var(--muted);
 }
 
-#sidebar footer {
-  padding: 8px 16px;
-  border-top: 1px solid var(--border);
-  font-size: 10px;
-  color: var(--muted);
-}
+/* --- locate-me control ------------------------------------------------------ */
 
-#sidebar footer a { color: var(--muted); }
-
-/* locate-me control */
 .locate-btn {
   display: flex;
   align-items: center;
@@ -386,7 +418,8 @@ html, body {
   50% { opacity: 0.4; }
 }
 
-/* plane markers */
+/* --- plane markers ----------------------------------------------------------- */
+
 .plane-icon { background: none; border: none; }
 
 .plane-icon svg {
@@ -395,8 +428,26 @@ html, body {
 
 .leaflet-container { font: inherit; }
 
+/* --- mobile: overlay panels become bottom sheets --------------------------- */
+
 @media (max-width: 720px) {
-  :root { --sidebar-w: 100%; }
-  #sidebar { height: 45%; bottom: auto; width: 100%; border-right: none; border-bottom: 1px solid var(--border); }
-  #map { left: 0; top: 45%; }
+  .overlay-panel {
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    max-width: 100%;
+    border-radius: 14px 14px 0 0;
+    max-height: 55vh;
+  }
+
+  .float-panel {
+    top: 60px;
+    right: 10px;
+    left: 10px;
+    width: auto;
+    max-width: none;
+  }
+
+  .status-pill { bottom: 24px; }
 }
