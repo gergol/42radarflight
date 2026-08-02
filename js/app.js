@@ -1,21 +1,23 @@
 /* 42RadarFlight — a minimal FlightRadar24-style live ADS-B viewer.
  *
- * Data sources (all free, keyless, CORS-enabled):
- *  - Live positions:  https://api.adsb.lol/v2/...           (aggregated ADS-B)
- *  - Flight routes:   https://api.adsb.lol/api/0/routeset   (callsign -> airports)
- *  - Flight track:    https://opensky-network.org/api/tracks/all
- *    (falls back to a trail accumulated from live positions in this session)
+ * Live positions come from a chain of free, keyless, CORS-enabled providers;
+ * if one is down (or blocked by an ad-blocker), the app fails over to the
+ * next automatically:
+ *   adsb.lol -> airplanes.live -> adsb.one -> adsb.fi -> OpenSky Network
+ *
+ * Routes (origin/destination): adsb.lol routeset API, with adsbdb.com as
+ * per-callsign fallback. Aircraft info fallback: adsbdb.com by hex.
+ * Track so far: OpenSky tracks API, falling back to the trail accumulated
+ * from live positions during this session.
  */
 
 "use strict";
 
-const ADSB_API = "https://api.adsb.lol";
-const OPENSKY_API = "https://opensky-network.org/api";
-
 const REFRESH_MS = 8000;          // live position refresh interval
-const MAX_RADIUS_NM = 250;        // adsb.lol hard limit
+const MAX_RADIUS_NM = 250;        // common provider limit
 const TRAIL_MAX_POINTS = 800;     // per-aircraft session trail cap
 const STALE_MS = 10 * 60 * 1000;  // forget aircraft not seen for 10 min
+const ADSBDB_LOOKUPS_PER_CYCLE = 5;
 
 // ---------------------------------------------------------------------------
 // Map setup
@@ -35,14 +37,18 @@ const trackLayer = L.layerGroup().addTo(map);
 // ---------------------------------------------------------------------------
 
 const state = {
-  aircraft: new Map(),   // hex -> latest ADS-B record
+  aircraft: new Map(),   // hex -> latest normalized position record
   markers: new Map(),    // hex -> Leaflet marker
   trails: new Map(),     // hex -> [{lat, lon, ts}] accumulated this session
-  routes: new Map(),     // callsign -> {origin, dest, airports} | null (looked up, none found)
+  routes: new Map(),     // callsign -> {origin, dest} | null (looked up, none found)
   routePending: new Set(),
+  acInfo: new Map(),     // hex -> {t, desc, r, ownOp} enrichment from adsbdb
+  acInfoPending: new Set(),
   selectedHex: null,
   lastUpdate: null,
-  fetchError: null,
+  fetchError: null,      // string describing why all providers failed
+  dataSource: null,      // name of the provider currently delivering data
+  routesetBroken: false, // adsb.lol batch route API unavailable -> use adsbdb
 };
 
 const ui = {
@@ -87,7 +93,7 @@ function viewRadiusNm() {
 function fmtAlt(ac) {
   if (ac.alt_baro === "ground") return "on ground";
   const alt = ac.alt_baro ?? ac.alt_geom;
-  return Number.isFinite(alt) ? `${alt.toLocaleString()} ft` : "—";
+  return Number.isFinite(alt) ? `${Math.round(alt).toLocaleString()} ft` : "—";
 }
 
 function fmtSpeed(ac) {
@@ -103,13 +109,19 @@ function fmtVertRate(ac) {
   const vr = ac.baro_rate ?? ac.geom_rate;
   if (!Number.isFinite(vr)) return "—";
   const arrow = vr > 100 ? "↑" : vr < -100 ? "↓" : "→";
-  return `${arrow} ${Math.abs(vr).toLocaleString()} ft/min`;
+  return `${arrow} ${Math.abs(Math.round(vr)).toLocaleString()} ft/min`;
 }
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
   );
+}
+
+function fetchOpts() {
+  return typeof AbortSignal !== "undefined" && AbortSignal.timeout
+    ? { signal: AbortSignal.timeout(8000) }
+    : {};
 }
 
 // ---------------------------------------------------------------------------
@@ -136,31 +148,90 @@ function planeIcon(heading, selected) {
 }
 
 // ---------------------------------------------------------------------------
-// Live position fetching (adsb.lol)
+// Live position providers (each returns a normalized aircraft array)
 // ---------------------------------------------------------------------------
+
+async function fetchTar1090Style(url) {
+  const res = await fetch(url, fetchOpts());
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  return (data.ac || []).filter((ac) => Number.isFinite(ac.lat) && Number.isFinite(ac.lon));
+}
+
+async function fetchOpenSkyStates() {
+  const b = map.getBounds();
+  const url =
+    `https://opensky-network.org/api/states/all` +
+    `?lamin=${b.getSouth().toFixed(3)}&lomin=${b.getWest().toFixed(3)}` +
+    `&lamax=${b.getNorth().toFixed(3)}&lomax=${b.getEast().toFixed(3)}`;
+  const res = await fetch(url, fetchOpts());
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  return (data.states || [])
+    .filter((s) => Number.isFinite(s[5]) && Number.isFinite(s[6]))
+    .map((s) => ({
+      hex: s[0],
+      flight: (s[1] || "").trim(),
+      lat: s[6],
+      lon: s[5],
+      alt_baro: s[8] ? "ground" : s[7] != null ? s[7] * 3.28084 : undefined,
+      gs: s[9] != null ? s[9] * 1.94384 : undefined,
+      track: s[10] ?? undefined,
+      baro_rate: s[11] != null ? s[11] * 196.85 : undefined,
+      squawk: s[14] || undefined,
+      // no type/registration in OpenSky state vectors; enriched via adsbdb
+    }));
+}
+
+const POSITION_PROVIDERS = [
+  {
+    name: "adsb.lol",
+    fetch: (lat, lon, r) => fetchTar1090Style(`https://api.adsb.lol/v2/point/${lat}/${lon}/${r}`),
+  },
+  {
+    name: "airplanes.live",
+    fetch: (lat, lon, r) => fetchTar1090Style(`https://api.airplanes.live/v2/point/${lat}/${lon}/${r}`),
+  },
+  {
+    name: "adsb.one",
+    fetch: (lat, lon, r) => fetchTar1090Style(`https://api.adsb.one/v2/point/${lat}/${lon}/${r}`),
+  },
+  {
+    name: "adsb.fi",
+    fetch: (lat, lon, r) =>
+      fetchTar1090Style(`https://opendata.adsb.fi/api/v2/lat/${lat}/lon/${lon}/dist/${r}`),
+  },
+  {
+    name: "OpenSky Network",
+    fetch: () => fetchOpenSkyStates(),
+  },
+];
+
+let providerIdx = 0; // sticks with the last provider that worked
 
 async function fetchAircraft() {
   const c = map.getCenter();
+  const lat = c.lat.toFixed(4);
+  const lon = c.lng.toFixed(4);
   const radius = viewRadiusNm();
-  const urls = [
-    `${ADSB_API}/v2/lat/${c.lat.toFixed(4)}/lon/${c.lng.toFixed(4)}/dist/${radius}`,
-    `${ADSB_API}/v2/point/${c.lat.toFixed(4)}/${c.lng.toFixed(4)}/${radius}`,
-  ];
 
-  let data = null;
-  let lastErr = null;
-  for (const url of urls) {
+  let list = null;
+  const errors = [];
+  for (let i = 0; i < POSITION_PROVIDERS.length; i++) {
+    const idx = (providerIdx + i) % POSITION_PROVIDERS.length;
+    const provider = POSITION_PROVIDERS[idx];
     try {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      data = await res.json();
+      list = await provider.fetch(lat, lon, radius);
+      providerIdx = idx;
+      state.dataSource = provider.name;
       break;
     } catch (err) {
-      lastErr = err;
+      errors.push(`${provider.name}: ${err.message || err.name || "failed"}`);
     }
   }
-  if (!data) {
-    state.fetchError = lastErr;
+
+  if (!list) {
+    state.fetchError = errors.join(" · ");
     render();
     return;
   }
@@ -169,8 +240,8 @@ async function fetchAircraft() {
   state.lastUpdate = Date.now();
   const now = Date.now();
 
-  for (const ac of data.ac || []) {
-    if (!Number.isFinite(ac.lat) || !Number.isFinite(ac.lon)) continue;
+  for (const ac of list) {
+    if (!ac.hex) continue;
     state.aircraft.set(ac.hex, { ...ac, _seen: now });
 
     // accumulate session trail
@@ -199,8 +270,14 @@ async function fetchAircraft() {
 }
 
 // ---------------------------------------------------------------------------
-// Route lookup (adsb.lol routeset) — needed for airport / route filters
+// Route lookup — adsb.lol routeset (batch) with adsbdb.com fallback
 // ---------------------------------------------------------------------------
+
+function normalizeAdsbdbAirport(a) {
+  return a
+    ? { icao: a.icao_code, iata: a.iata_code, name: a.name, location: a.municipality }
+    : null;
+}
 
 async function fetchRoutes() {
   const wanted = [];
@@ -212,46 +289,141 @@ async function fetchRoutes() {
   }
   if (wanted.length === 0) return;
 
-  const batch = wanted.slice(0, 100);
-  batch.forEach((p) => state.routePending.add(p.callsign));
+  if (!state.routesetBroken) {
+    const batch = wanted.slice(0, 100);
+    batch.forEach((p) => state.routePending.add(p.callsign));
+    try {
+      const res = await fetch("https://api.adsb.lol/api/0/routeset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ planes: batch }),
+        ...fetchOpts(),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const results = await res.json();
 
-  try {
-    const res = await fetch(`${ADSB_API}/api/0/routeset`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ planes: batch }),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const results = await res.json();
-
-    for (const r of results || []) {
-      const cs = (r.callsign || "").toUpperCase();
-      const airports = r._airports || [];
-      if (airports.length >= 2) {
-        state.routes.set(cs, {
-          origin: airports[0],
-          dest: airports[airports.length - 1],
-          airports,
-        });
-      } else {
-        state.routes.set(cs, null); // looked up, nothing known
+      for (const r of results || []) {
+        const cs = (r.callsign || "").toUpperCase();
+        const airports = r._airports || [];
+        if (airports.length >= 2) {
+          state.routes.set(cs, { origin: airports[0], dest: airports[airports.length - 1] });
+        } else {
+          state.routes.set(cs, null);
+        }
       }
+      for (const p of batch) {
+        if (!state.routes.has(p.callsign)) state.routes.set(p.callsign, null);
+      }
+      render();
+      return;
+    } catch (err) {
+      console.warn("adsb.lol routeset unavailable, falling back to adsbdb:", err);
+      state.routesetBroken = true;
+    } finally {
+      batch.forEach((p) => state.routePending.delete(p.callsign));
     }
-    // anything the API didn't answer for: mark unknown so we don't loop
-    for (const p of batch) {
-      if (!state.routes.has(p.callsign)) state.routes.set(p.callsign, null);
-    }
-    render();
-  } catch (err) {
-    console.warn("routeset lookup failed:", err);
-  } finally {
-    batch.forEach((p) => state.routePending.delete(p.callsign));
   }
+
+  // adsbdb fallback: individual lookups, a few per refresh cycle.
+  // Prioritize the selected plane, then the ones currently shown on the map.
+  const priority = new Map(); // callsign -> rank
+  const shownSet = new Set(visibleAircraft().map((a) => callsignOf(a)));
+  for (const p of wanted) {
+    const selectedCs =
+      state.selectedHex && state.aircraft.has(state.selectedHex)
+        ? callsignOf(state.aircraft.get(state.selectedHex))
+        : null;
+    priority.set(p.callsign, p.callsign === selectedCs ? 0 : shownSet.has(p.callsign) ? 1 : 2);
+  }
+  const queue = wanted
+    .sort((a, b) => priority.get(a.callsign) - priority.get(b.callsign))
+    .slice(0, ADSBDB_LOOKUPS_PER_CYCLE);
+
+  await Promise.all(
+    queue.map(async (p) => {
+      state.routePending.add(p.callsign);
+      try {
+        const res = await fetch(
+          `https://api.adsbdb.com/v0/callsign/${encodeURIComponent(p.callsign)}`,
+          fetchOpts()
+        );
+        if (res.status === 404) {
+          state.routes.set(p.callsign, null);
+          return;
+        }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const fr = data?.response?.flightroute;
+        if (fr && fr.origin && fr.destination) {
+          state.routes.set(p.callsign, {
+            origin: normalizeAdsbdbAirport(fr.origin),
+            dest: normalizeAdsbdbAirport(fr.destination),
+          });
+        } else {
+          state.routes.set(p.callsign, null);
+        }
+      } catch (err) {
+        console.warn(`adsbdb route lookup failed for ${p.callsign}:`, err);
+        // leave un-cached so it can retry next cycle
+      } finally {
+        state.routePending.delete(p.callsign);
+      }
+    })
+  );
+  render();
 }
 
 function routeOf(ac) {
   const cs = callsignOf(ac);
   return cs ? state.routes.get(cs) : undefined; // undefined = not looked up yet
+}
+
+// ---------------------------------------------------------------------------
+// Aircraft info enrichment (adsbdb by hex) — for providers without type data
+// ---------------------------------------------------------------------------
+
+async function fetchAircraftInfo(hex) {
+  if (state.acInfo.has(hex) || state.acInfoPending.has(hex)) return;
+  state.acInfoPending.add(hex);
+  try {
+    const res = await fetch(`https://api.adsbdb.com/v0/aircraft/${hex}`, fetchOpts());
+    if (res.status === 404) {
+      state.acInfo.set(hex, null);
+      return;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const a = data?.response?.aircraft;
+    state.acInfo.set(
+      hex,
+      a
+        ? {
+            t: a.icao_type || a.type,
+            desc: [a.manufacturer, a.type].filter(Boolean).join(" "),
+            r: a.registration,
+            ownOp: a.registered_owner,
+          }
+        : null
+    );
+    if (hex === state.selectedHex) renderDetail();
+  } catch (err) {
+    console.warn(`adsbdb aircraft lookup failed for ${hex}:`, err);
+  } finally {
+    state.acInfoPending.delete(hex);
+  }
+}
+
+/** Merge live record with any adsbdb enrichment. */
+function enriched(ac) {
+  const info = state.acInfo.get(ac.hex);
+  if (!info) return ac;
+  return {
+    ...ac,
+    t: ac.t || info.t,
+    desc: ac.desc || info.desc,
+    r: ac.r || info.r,
+    ownOp: ac.ownOp || info.ownOp,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -336,8 +508,9 @@ function render() {
       marker.setLatLng([ac.lat, ac.lon]);
       marker.setIcon(icon);
     }
+    const e = enriched(ac);
     const cs = callsignOf(ac) || ac.hex;
-    marker.bindTooltip(`${cs}${ac.t ? " · " + ac.t : ""}`, { direction: "top", offset: [0, -12] });
+    marker.bindTooltip(`${cs}${e.t ? " · " + e.t : ""}`, { direction: "top", offset: [0, -12] });
   }
 
   renderPlaneList(shown);
@@ -357,6 +530,7 @@ function render() {
 function renderPlaneList(shown) {
   ui.planeList.innerHTML = "";
   for (const ac of shown) {
+    const e = enriched(ac);
     const cs = callsignOf(ac) || ac.hex.toUpperCase();
     const route = routeOf(ac);
     const routeStr = route
@@ -369,7 +543,7 @@ function renderPlaneList(shown) {
     row.className = "plane-row" + (ac.hex === state.selectedHex ? " selected" : "");
     row.innerHTML = `
       <span class="cs">${escapeHtml(cs)}</span>
-      <span class="type">${escapeHtml(ac.t || "?")}</span>
+      <span class="type">${escapeHtml(e.t || "?")}</span>
       <span class="route">${escapeHtml(routeStr)}</span>`;
     row.addEventListener("click", () => {
       selectAircraft(ac.hex);
@@ -383,10 +557,11 @@ function renderStatus(shown) {
   const total = state.aircraft.size;
   const time = state.lastUpdate ? new Date(state.lastUpdate).toLocaleTimeString() : "—";
   let html = `Showing <b>${shown.length}</b> of ${total} aircraft in range · updated ${time}`;
+  if (state.dataSource) html += ` · via ${escapeHtml(state.dataSource)}`;
   if (state.fetchError) {
-    html += `<br><span class="warn">Live data fetch failed (${escapeHtml(
-      state.fetchError.message || "network error"
-    )}) — retrying…</span>`;
+    html += `<br><span class="warn">All data sources failed — retrying…<br>${escapeHtml(
+      state.fetchError
+    )}</span>`;
   }
   ui.status.innerHTML = html;
 }
@@ -397,6 +572,8 @@ function renderStatus(shown) {
 
 async function selectAircraft(hex) {
   state.selectedHex = hex;
+  const ac = state.aircraft.get(hex);
+  if (ac && (!ac.t || !ac.r)) fetchAircraftInfo(hex); // enrich if provider lacks type data
   render();
   drawTrack(hex); // async: OpenSky first, session-trail fallback
 }
@@ -409,8 +586,9 @@ function clearSelection() {
 }
 
 function renderDetail() {
-  const ac = state.aircraft.get(state.selectedHex);
-  if (!ac) return;
+  const raw = state.aircraft.get(state.selectedHex);
+  if (!raw) return;
+  const ac = enriched(raw);
   const cs = callsignOf(ac) || ac.hex.toUpperCase();
   const route = routeOf(ac);
 
@@ -469,7 +647,10 @@ async function drawTrack(hex) {
 
   // 1) try OpenSky's track-so-far endpoint (full trip since takeoff)
   try {
-    const res = await fetch(`${OPENSKY_API}/tracks/all?icao24=${hex.toLowerCase()}&time=0`);
+    const res = await fetch(
+      `https://opensky-network.org/api/tracks/all?icao24=${hex.toLowerCase()}&time=0`,
+      fetchOpts()
+    );
     if (res.ok) {
       const data = await res.json();
       const path = (data.path || [])

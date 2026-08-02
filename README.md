@@ -43,8 +43,9 @@ Then open <http://localhost:8000>.
 | Concern | Source |
 |---|---|
 | Map tiles | OpenStreetMap |
-| Live positions, aircraft type, registration | `api.adsb.lol/v2/lat/{lat}/lon/{lon}/dist/{nm}` |
-| Route (origin/destination airports) | `api.adsb.lol/api/0/routeset` (POST, batched per callsign) |
+| Live positions, aircraft type, registration | adsb.lol → airplanes.live → adsb.one → adsb.fi → OpenSky (automatic failover; the active source is shown in the status bar) |
+| Route (origin/destination airports) | `api.adsb.lol/api/0/routeset` (batch), falling back to `api.adsbdb.com/v0/callsign/{cs}` |
+| Aircraft type/registration when the position source lacks it | `api.adsbdb.com/v0/aircraft/{hex}` |
 | Track so far | `opensky-network.org/api/tracks/all?icao24=…&time=0`, with a client-side session trail as fallback |
 
 Notes and limits:
