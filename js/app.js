@@ -270,17 +270,84 @@ function fetchOpts() {
 // Plane icon
 // ---------------------------------------------------------------------------
 
-function planeIcon(heading, selected) {
+// Silhouette per aircraft class, chosen from the ICAO type designator and
+// the ADS-B emitter category (A5 heavy, A7 rotorcraft, B1 glider, ...).
+
+const HEAVY_TYPES = ["A33", "A34", "A35", "A38", "B74", "B76", "B77", "B78", "MD11", "IL9", "A124", "A225", "C17"];
+const REGIONAL_TYPES = ["CRJ", "E13", "E14", "E17", "E19", "E27", "E29", "F70", "F100", "RJ", "B46", "AT4", "AT7", "DH8", "SF3", "JS3", "JS4", "D328", "F50"];
+const BIZJET_TYPES = ["GLF", "GL5", "GL6", "GL7", "GLEX", "CL3", "CL6", "C25", "C50", "C51", "C52", "C55", "C56", "C68", "C70", "C75", "LJ", "LR", "F2TH", "F90", "FA5", "FA7", "FA8", "H25", "HDJT", "PC24", "E35L", "E50P", "E55P", "PRM1", "BE40", "G150", "G280"];
+const PROP_TYPES = ["C1", "C2", "C30", "C310", "C40", "P28", "PA1", "PA2", "PA3", "PA4", "P46", "SR2", "DA2", "DA4", "DA6", "DR4", "DV2", "M20", "BE3", "BE5", "BE9", "BE20", "B350", "AA5", "AC11", "G115", "TBM", "PC12", "PC6", "C208", "AQUI", "RV", "J3", "CUB", "P208", "TECN", "EV97", "FK9"];
+const HELI_TYPES = ["R22", "R44", "R66", "B06", "B407", "B412", "B429", "B430", "A109", "A119", "A139", "A169", "A189", "AW", "EC1", "EC2", "EC3", "EC4", "EC6", "AS3", "AS5", "H500", "H60", "UH1", "S76", "S92", "MI8", "MI2", "KA32", "EN28", "H145", "H135", "H160"];
+const GLIDER_TYPES = ["GLID", "ASW", "ASG", "ASH", "ASK", "DG1", "DG4", "DG5", "DG8", "LS4", "LS6", "LS8", "LS1", "VENT", "DISC", "DUOD", "ARCU", "JANU", "NIMB", "SZD", "PIK2", "TWSH"];
+
+function classifyAircraft(ac) {
+  const t = (ac.t || "").toUpperCase();
+  const cat = (ac.category || "").toUpperCase();
+  const has = (list) => t && list.some((p) => t.startsWith(p));
+  if (cat === "A7" || has(HELI_TYPES)) return "heli";
+  if (cat === "B1" || cat === "B4" || has(GLIDER_TYPES)) return "glider";
+  if (cat === "A5" || has(HEAVY_TYPES)) return "heavy";
+  if (has(BIZJET_TYPES)) return "bizjet";
+  if (has(PROP_TYPES) || cat === "A1") return "prop";
+  if (has(REGIONAL_TYPES)) return "regional";
+  if (cat === "A2") return "bizjet";
+  return "airliner"; // narrow-body default
+}
+
+const AIRLINER_PATH =
+  "M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z";
+
+const ICON_SHAPES = {
+  heavy: {
+    size: 34,
+    svg: (c) => `<path fill="${c}" stroke="#0d1420" stroke-width="0.6" d="${AIRLINER_PATH}"/>`,
+  },
+  airliner: {
+    size: 27,
+    svg: (c) => `<path fill="${c}" stroke="#0d1420" stroke-width="0.6" d="${AIRLINER_PATH}"/>`,
+  },
+  regional: {
+    size: 22,
+    svg: (c) => `<path fill="${c}" stroke="#0d1420" stroke-width="0.6" d="${AIRLINER_PATH}"/>`,
+  },
+  bizjet: {
+    size: 21,
+    svg: (c) => `<path fill="${c}" stroke="#0d1420" stroke-width="0.5"
+      d="M12 2c.5 0 .8.5.8 1.2V10l6.2 3.7v1.6l-6.2-1.8v4.6l2.3 1.6v1.3L12 20.2l-3.1.8v-1.3l2.3-1.6v-4.6L5 15.3v-1.6L11.2 10V3.2c0-.7.3-1.2.8-1.2z"/>`,
+  },
+  prop: {
+    size: 22,
+    svg: (c) => `
+      <rect x="8.6" y="2.4" width="6.8" height="1" rx="0.5" fill="${c}"/>
+      <path fill="${c}" stroke="#0d1420" stroke-width="0.5"
+        d="M11.3 3.6h1.4v4.8l8.3 1v2.2l-8.3-.4v5.4l2.6 1.7v1.4l-3.3-.7-3.3.7v-1.4l2.6-1.7v-5.4l-8.3.4V9.4l8.3-1V3.6z"/>`,
+  },
+  heli: {
+    size: 24,
+    svg: (c) => `
+      <g stroke="${c}" stroke-width="1.3" stroke-linecap="round">
+        <line x1="4.5" y1="4.5" x2="19.5" y2="19.5"/>
+        <line x1="19.5" y1="4.5" x2="4.5" y2="19.5"/>
+      </g>
+      <ellipse cx="12" cy="11.5" rx="2.6" ry="4.2" fill="${c}" stroke="#0d1420" stroke-width="0.5"/>
+      <rect x="11.45" y="15" width="1.1" height="5.4" fill="${c}"/>
+      <rect x="9.9" y="20" width="4.2" height="1.1" rx="0.5" fill="${c}"/>`,
+  },
+  glider: {
+    size: 27,
+    svg: (c) => `<path fill="${c}" stroke="#0d1420" stroke-width="0.4"
+      d="M12 2.4c.4 0 .6.4.6 1v6l9.6.7v1.3l-9.6-.2v6.6l2 1.4v1.1l-2.6-.4-2.6.4v-1.1l2-1.4v-6.6l-9.6.2v-1.3l9.6-.7v-6c0-.6.2-1 .6-1z"/>`,
+  },
+};
+
+function planeIcon(ac, selected) {
+  const shape = ICON_SHAPES[classifyAircraft(ac)] || ICON_SHAPES.airliner;
   const color = selected ? "#f5a623" : "#2f9dff";
-  const size = selected ? 34 : 28;
-  const rot = Number.isFinite(heading) ? heading : 0;
-  // Material Design "flight" glyph, nose pointing north at 0°.
+  const size = shape.size + (selected ? 6 : 0);
+  const rot = Number.isFinite(ac.track) ? ac.track : 0;
   const html = `
     <svg width="${size}" height="${size}" viewBox="0 0 24 24"
-         style="transform: rotate(${rot}deg);">
-      <path fill="${color}" stroke="#0d1420" stroke-width="0.6"
-        d="M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/>
-    </svg>`;
+         style="transform: rotate(${rot}deg);">${shape.svg(color)}</svg>`;
   return L.divIcon({
     className: "plane-icon",
     html,
@@ -648,7 +715,8 @@ function render() {
   // add / update markers
   for (const ac of shown) {
     const selected = ac.hex === state.selectedHex;
-    const icon = planeIcon(ac.track, selected);
+    const e = enriched(ac);
+    const icon = planeIcon(e, selected);
     let marker = state.markers.get(ac.hex);
     if (!marker) {
       marker = L.marker([ac.lat, ac.lon], { icon, riseOnHover: true });
@@ -659,7 +727,6 @@ function render() {
       marker.setLatLng([ac.lat, ac.lon]);
       marker.setIcon(icon);
     }
-    const e = enriched(ac);
     const cs = callsignOf(ac) || ac.hex;
     marker.bindTooltip(`${cs}${e.t ? " · " + e.t : ""}`, { direction: "top", offset: [0, -12] });
   }
