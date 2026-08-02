@@ -32,6 +32,86 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
 
 const trackLayer = L.layerGroup().addTo(map);
 
+// --- "center on my position" control ---------------------------------------
+
+const locationLayer = L.layerGroup().addTo(map);
+
+const LocateControl = L.Control.extend({
+  options: { position: "topleft" },
+  onAdd() {
+    const btn = L.DomUtil.create("a", "locate-btn leaflet-bar");
+    btn.href = "#";
+    btn.title = "Center map on my position";
+    btn.setAttribute("role", "button");
+    btn.setAttribute("aria-label", "Center map on my position");
+    btn.innerHTML = `
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        <path fill="currentColor" d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm8.94 3A8.99 8.99 0 0 0 13
+          3.06V1h-2v2.06A8.99 8.99 0 0 0 3.06 11H1v2h2.06A8.99 8.99 0 0 0 11 20.94V23h2v-2.06A8.99
+          8.99 0 0 0 20.94 13H23v-2h-2.06zM12 19a7 7 0 1 1 0-14 7 7 0 0 1 0 14z"/>
+      </svg>`;
+    L.DomEvent.on(btn, "click", (e) => {
+      L.DomEvent.stop(e);
+      locateMe(btn);
+    });
+    return btn;
+  },
+});
+map.addControl(new LocateControl());
+
+function locateMe(btn) {
+  if (!("geolocation" in navigator)) {
+    setStatusNote("Geolocation is not supported by this browser.", true);
+    return;
+  }
+  btn.classList.add("locating");
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      btn.classList.remove("locating");
+      const { latitude, longitude, accuracy } = pos.coords;
+
+      locationLayer.clearLayers();
+      L.circle([latitude, longitude], {
+        radius: Math.max(accuracy, 30),
+        color: "#2f9dff",
+        weight: 1,
+        fillColor: "#2f9dff",
+        fillOpacity: 0.12,
+      }).addTo(locationLayer);
+      L.circleMarker([latitude, longitude], {
+        radius: 7,
+        color: "#ffffff",
+        weight: 2,
+        fillColor: "#2f9dff",
+        fillOpacity: 1,
+      })
+        .bindTooltip("You are here")
+        .addTo(locationLayer);
+
+      // setView fires moveend, which reloads aircraft for the new area
+      map.setView([latitude, longitude], Math.max(map.getZoom(), 8));
+      setStatusNote(null);
+    },
+    (err) => {
+      btn.classList.remove("locating");
+      const reasons = {
+        1: "location permission denied — allow it in your browser settings",
+        2: "position unavailable",
+        3: "timed out getting a GPS fix",
+      };
+      setStatusNote(`Could not get your position: ${reasons[err.code] || err.message}.`, true);
+    },
+    { enableHighAccuracy: true, timeout: 15000, maximumAge: 60000 }
+  );
+}
+
+let statusNote = null; // transient message shown in the status bar
+
+function setStatusNote(msg, isWarning = false) {
+  statusNote = msg ? { msg, isWarning } : null;
+  render();
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -562,6 +642,9 @@ function renderStatus(shown) {
     html += `<br><span class="warn">All data sources failed — retrying…<br>${escapeHtml(
       state.fetchError
     )}</span>`;
+  }
+  if (statusNote) {
+    html += `<br><span class="${statusNote.isWarning ? "warn" : ""}">${escapeHtml(statusNote.msg)}</span>`;
   }
   ui.status.innerHTML = html;
 }
