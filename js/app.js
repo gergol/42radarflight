@@ -194,6 +194,10 @@ const ui = {
   detailCallsign: document.getElementById("detail-callsign"),
   detailBody: document.getElementById("detail-body"),
   detailClose: document.getElementById("detail-close"),
+  btnFilters: document.getElementById("btn-filters"),
+  btnSettings: document.getElementById("btn-settings"),
+  filtersPanel: document.getElementById("filters-panel"),
+  settingsPanel: document.getElementById("settings-panel"),
   flightSearch: document.getElementById("flight-search"),
   flightSearchBtn: document.getElementById("flight-search-btn"),
   flightPanel: document.getElementById("flight-panel"),
@@ -675,6 +679,8 @@ function render() {
 }
 
 function renderPlaneList(shown) {
+  // the list lives inside the filters panel — skip DOM churn while hidden
+  if (ui.filtersPanel.classList.contains("hidden")) return;
   ui.planeList.innerHTML = "";
   for (const ac of shown) {
     const e = enriched(ac);
@@ -1337,6 +1343,22 @@ ui.clearFilters.addEventListener("click", () => {
   render();
 });
 ui.detailClose.addEventListener("click", clearSelection);
+
+function toggleFloatPanel(panel, btn) {
+  const wasHidden = panel.classList.contains("hidden");
+  ui.filtersPanel.classList.add("hidden");
+  ui.settingsPanel.classList.add("hidden");
+  ui.btnFilters.classList.remove("active");
+  ui.btnSettings.classList.remove("active");
+  if (wasHidden) {
+    panel.classList.remove("hidden");
+    btn.classList.add("active");
+    render(); // fill the plane list if it just became visible
+  }
+}
+ui.btnFilters.addEventListener("click", () => toggleFloatPanel(ui.filtersPanel, ui.btnFilters));
+ui.btnSettings.addEventListener("click", () => toggleFloatPanel(ui.settingsPanel, ui.btnSettings));
+
 ui.flightSearchBtn.addEventListener("click", () => searchFlight(ui.flightSearch.value));
 ui.flightSearch.addEventListener("keydown", (e) => {
   if (e.key === "Enter") searchFlight(ui.flightSearch.value);

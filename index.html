@@ -7,85 +7,89 @@
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
         integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
   <!-- bump ?v= together with the visible build number below on every deploy -->
-  <link rel="stylesheet" href="css/style.css?v=11" />
+  <link rel="stylesheet" href="css/style.css?v=12" />
 </head>
 <body>
-  <div id="sidebar">
-    <header>
-      <h1>42RadarFlight</h1>
-      <p class="subtitle">Live ADS-B · OpenStreetMap · build 11</p>
-    </header>
+  <div id="map"></div>
 
-    <section class="controls">
-      <div class="control-row">
-        <label for="limit-select">Aircraft shown</label>
-        <select id="limit-select">
-          <option value="3" selected>3 (nearest to map centre)</option>
-          <option value="10">10</option>
-          <option value="25">25</option>
-          <option value="50">50</option>
-          <option value="0">All in range</option>
-        </select>
-      </div>
-
-      <div class="control-row">
-        <label for="flight-search">Find flight number</label>
-        <div class="row-inline">
-          <input id="flight-search" type="text" placeholder="e.g. OS26 or AUA26"
-                 autocomplete="off" spellcheck="false" />
-          <button id="flight-search-btn" type="button">Search</button>
-        </div>
-      </div>
-
-      <div class="control-row">
-        <label for="filter-airport">Filter by airport (ICAO or IATA)</label>
-        <input id="filter-airport" type="text" placeholder="e.g. EDDF or FRA"
-               autocomplete="off" spellcheck="false" maxlength="4" />
-      </div>
-
-      <div class="control-row">
-        <label for="filter-route">Filter by route (origin-destination)</label>
-        <input id="filter-route" type="text" placeholder="e.g. EDDF-KJFK"
-               autocomplete="off" spellcheck="false" />
-      </div>
-
-      <button id="clear-filters" type="button">Clear filters</button>
-      <p class="hint">Filters need route data, which is looked up per callsign —
-        give it a few seconds after the first load. Aircraft with unknown routes
-        are hidden while a filter is active.</p>
-    </section>
-
-    <section id="status" class="status">Loading aircraft…</section>
-
-    <section id="plane-list" class="plane-list"></section>
-
-    <section id="flight-panel" class="detail-panel hidden">
-      <div class="detail-header">
-        <h2 id="flight-title">Flight</h2>
-        <button id="flight-close" type="button" title="Close">×</button>
-      </div>
-      <div id="flight-body"></div>
-    </section>
-
-    <section id="detail-panel" class="detail-panel hidden">
-      <div class="detail-header">
-        <h2 id="detail-callsign">—</h2>
-        <button id="detail-close" type="button" title="Close">×</button>
-      </div>
-      <div id="detail-body"></div>
-    </section>
-
-    <footer>
-      <p>Positions: <a href="https://adsb.lol" target="_blank" rel="noopener">adsb.lol</a> ·
-         Tracks: <a href="https://opensky-network.org" target="_blank" rel="noopener">OpenSky</a> ·
-         Map © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors</p>
-    </footer>
+  <div class="fab-stack">
+    <button id="btn-filters" class="fab" type="button" title="Search & filters" aria-label="Search and filters">🔍</button>
+    <button id="btn-settings" class="fab" type="button" title="Settings" aria-label="Settings">⚙️</button>
   </div>
 
-  <div id="map"></div>
+  <div id="filters-panel" class="float-panel hidden">
+    <h2>Search &amp; filters</h2>
+
+    <div class="control-row">
+      <label for="flight-search">Find flight number</label>
+      <div class="row-inline">
+        <input id="flight-search" type="text" placeholder="e.g. OS26 or AUA26"
+               autocomplete="off" spellcheck="false" />
+        <button id="flight-search-btn" type="button">Search</button>
+      </div>
+    </div>
+
+    <div class="control-row">
+      <label for="filter-airport">Filter by airport (ICAO or IATA)</label>
+      <input id="filter-airport" type="text" placeholder="e.g. EDDF or FRA"
+             autocomplete="off" spellcheck="false" maxlength="4" />
+    </div>
+
+    <div class="control-row">
+      <label for="filter-route">Filter by route (origin-destination)</label>
+      <input id="filter-route" type="text" placeholder="e.g. EDDF-KJFK"
+             autocomplete="off" spellcheck="false" />
+    </div>
+
+    <button id="clear-filters" type="button">Clear filters</button>
+    <p class="hint">Filters need route data, looked up per callsign — give it a few
+      seconds. Aircraft with unknown routes are hidden while a filter is active.</p>
+
+    <h3>Matching aircraft</h3>
+    <div id="plane-list" class="plane-list"></div>
+  </div>
+
+  <div id="settings-panel" class="float-panel hidden">
+    <h2>Settings</h2>
+
+    <div class="control-row">
+      <label for="limit-select">Aircraft shown (nearest to map centre)</label>
+      <select id="limit-select">
+        <option value="3">3</option>
+        <option value="10">10</option>
+        <option value="25">25</option>
+        <option value="50">50</option>
+        <option value="100" selected>100</option>
+        <option value="0">All in range</option>
+      </select>
+    </div>
+
+    <p class="hint">42RadarFlight · build 12<br>
+      Positions: adsb.lol / airplanes.live / adsb.one / adsb.fi / OpenSky ·
+      Routes: adsbdb.com · Schedules: AeroDataBox ·
+      Map © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors</p>
+  </div>
+
+  <div id="status" class="status-pill">Loading aircraft…</div>
+
+  <section id="flight-panel" class="overlay-panel hidden">
+    <div class="detail-header">
+      <h2 id="flight-title">Flight</h2>
+      <button id="flight-close" type="button" title="Close">×</button>
+    </div>
+    <div id="flight-body"></div>
+  </section>
+
+  <section id="detail-panel" class="overlay-panel hidden">
+    <div class="detail-header">
+      <h2 id="detail-callsign">—</h2>
+      <button id="detail-close" type="button" title="Close">×</button>
+    </div>
+    <div id="detail-body"></div>
+  </section>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
           integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <script src="js/app.js?v=11"></script>
+  <script src="js/app.js?v=12"></script>
 </body>
 </html>
