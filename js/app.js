@@ -125,18 +125,29 @@ function locateMe(btn) {
 
   const giveUpTimer = setTimeout(() => finish({ code: 3 }), LOCATE_WINDOW_MS);
 
-  // Accept the first fix we can get — even a coarse network-based or cached
-  // one — center the map on it immediately, then keep watching so the marker
-  // tightens as better fixes arrive. Stop early once accuracy is good.
+  // Center on the best fix seen so far; recenter only for the very first one.
+  const usePos = (pos) => {
+    if (finished) return;
+    const isFirst = !best;
+    if (isFirst || pos.coords.accuracy < best.coords.accuracy) {
+      best = pos;
+      showPosition(pos, isFirst);
+    }
+    if (pos.coords.accuracy <= LOCATE_GOOD_ACCURACY_M) finish();
+  };
+
+  // Fast path: explicitly ask for a cheap fix (cached or network-based).
+  // This usually returns within a second, long before GPS has warmed up.
+  navigator.geolocation.getCurrentPosition(
+    usePos,
+    () => {}, // ignore — the high-accuracy watch below is the fallback
+    { enableHighAccuracy: false, maximumAge: 600000, timeout: 3000 }
+  );
+
+  // Refinement path: high-accuracy watch tightens the marker as GPS fixes
+  // arrive. Stops early once accuracy is good.
   watchId = navigator.geolocation.watchPosition(
-    (pos) => {
-      const isFirst = !best;
-      if (isFirst || pos.coords.accuracy < best.coords.accuracy) {
-        best = pos;
-        showPosition(pos, isFirst);
-      }
-      if (pos.coords.accuracy <= LOCATE_GOOD_ACCURACY_M) finish();
-    },
+    usePos,
     (err) => {
       // only fatal if we never got any fix at all
       if (!best) finish(err);
