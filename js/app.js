@@ -183,6 +183,12 @@ const ui = {
   detailCallsign: document.getElementById("detail-callsign"),
   detailBody: document.getElementById("detail-body"),
   detailClose: document.getElementById("detail-close"),
+  flightSearch: document.getElementById("flight-search"),
+  flightSearchBtn: document.getElementById("flight-search-btn"),
+  flightPanel: document.getElementById("flight-panel"),
+  flightTitle: document.getElementById("flight-title"),
+  flightBody: document.getElementById("flight-body"),
+  flightClose: document.getElementById("flight-close"),
 };
 
 // ---------------------------------------------------------------------------
@@ -487,6 +493,7 @@ async function fetchRoutes() {
           state.routes.set(p.callsign, {
             origin: normalizeAdsbdbAirport(fr.origin),
             dest: normalizeAdsbdbAirport(fr.destination),
+            flightNumber: fr.callsign_iata || null,
           });
         } else {
           state.routes.set(p.callsign, null);
@@ -668,16 +675,25 @@ function renderPlaneList(shown) {
         ? "route n/a"
         : "route …";
 
+    const flightNo = route?.flightNumber || null;
     const row = document.createElement("div");
     row.className = "plane-row" + (ac.hex === state.selectedHex ? " selected" : "");
     row.innerHTML = `
-      <span class="cs">${escapeHtml(cs)}</span>
+      <span class="cs" title="Tap for flight schedule">${escapeHtml(flightNo || cs)}</span>
       <span class="type">${escapeHtml(e.t || "?")}</span>
       <span class="route">${escapeHtml(routeStr)}</span>`;
     row.addEventListener("click", () => {
       selectAircraft(ac.hex);
       map.panTo([ac.lat, ac.lon]);
     });
+    const csEl = row.querySelector(".cs");
+    if (callsignOf(ac) || flightNo) {
+      csEl.classList.add("clickable");
+      csEl.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        searchFlight(flightNo || cs);
+      });
+    }
     ui.planeList.appendChild(row);
   }
 }
@@ -727,6 +743,7 @@ function renderDetail() {
   ui.detailCallsign.textContent = cs;
 
   const items = [
+    ["Flight number", route?.flightNumber || "—"],
     ["Aircraft type", ac.t || "unknown"],
     ["Registration", ac.r || "—"],
     ["Altitude", fmtAlt(ac)],
@@ -763,6 +780,10 @@ function renderDetail() {
     html += `<div class="route-box">Looking up route…</div>`;
   }
 
+  if (cs && cs !== ac.hex.toUpperCase()) {
+    html += `<button class="btn-mini sched-btn" id="detail-sched-btn">🗓 Flight schedule for ${escapeHtml(route?.flightNumber || cs)}</button>`;
+  }
+
   html += `
     <div class="alt-legend">
       <span>0 ft</span>
@@ -772,6 +793,11 @@ function renderDetail() {
     <div class="trail-note" id="trail-note"></div>`;
   ui.detailBody.innerHTML = html;
   ui.detailPanel.classList.remove("hidden");
+
+  const schedBtn = document.getElementById("detail-sched-btn");
+  if (schedBtn) {
+    schedBtn.addEventListener("click", () => searchFlight(route?.flightNumber || cs));
+  }
 }
 
 // --- track drawing ---------------------------------------------------------
@@ -798,8 +824,9 @@ function altBucket(alt) {
   return Number.isFinite(alt) ? Math.round(alt / 2000) : -1;
 }
 
-/** Parse a tar1090-style trace file (adsb.lol /v0/trace/{icao}). */
+/** Parse a tar1090-style trace file and keep only the current flight leg. */
 function parseTar1090Trace(data) {
+  const baseTs = Number(data.timestamp) || 0;
   const arr = data.trace || data.full?.trace || data.recent?.trace || [];
   const points = [];
   let lastAlt = null;
@@ -809,9 +836,43 @@ function parseTar1090Trace(data) {
     if (alt === "ground") alt = 0;
     if (!Number.isFinite(alt)) alt = lastAlt;
     else lastAlt = alt;
-    points.push({ lat: p[1], lon: p[2], alt });
+    points.push({
+      lat: p[1],
+      lon: p[2],
+      alt,
+      ts: baseTs + (Number(p[0]) || 0),
+      newLeg: ((p[6] || 0) & 2) === 2, // readsb marks the first point of a new leg
+    });
   }
-  return points;
+  return currentLeg(points);
+}
+
+/**
+ * A trace file covers the whole UTC day, i.e. every flight the aircraft made.
+ * Keep only the latest leg: cut at readsb leg markers, at gaps of >15 min
+ * without positions, and at lift-offs that follow >=5 min parked on ground.
+ */
+function currentLeg(points) {
+  if (points.length < 2) return points;
+  let start = 0;
+  let groundSince = null;
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    if (i > 0) {
+      if (p.newLeg || p.ts - points[i - 1].ts > 900) {
+        start = i;
+        groundSince = null;
+        continue;
+      }
+    }
+    if (p.alt !== null && p.alt <= 100) {
+      if (groundSince === null) groundSince = p.ts;
+    } else {
+      if (groundSince !== null && p.ts - groundSince >= 300) start = i;
+      groundSince = null;
+    }
+  }
+  return points.slice(start);
 }
 
 // tar1090 trace file layout used by most aggregator globes:
@@ -1005,6 +1066,254 @@ function updateSelectedTrackLine() {
 }
 
 // ---------------------------------------------------------------------------
+// Flight number search + schedule panel
+//
+// Number resolution (OS26 <-> AUA26) and route: adsbdb.com (keyless).
+// Live position by callsign: the ADS-B aggregators (keyless, worldwide).
+// Multi-day schedule with planned/actual times: AeroDataBox via RapidAPI —
+// needs a personal (free-tier) key, stored in localStorage only.
+// ---------------------------------------------------------------------------
+
+const FLIGHT_LIVE_SOURCES = [
+  (cs) => `https://api.adsb.lol/v2/callsign/${cs}`,
+  (cs) => `https://api.airplanes.live/v2/callsign/${cs}`,
+  (cs) => `https://api.adsb.one/v2/callsign/${cs}`,
+  (cs) => `https://opendata.adsb.fi/api/v2/callsign/${cs}`,
+];
+
+async function findLiveByCallsign(callsigns) {
+  for (const cs of [...new Set(callsigns.filter(Boolean))]) {
+    for (const mkUrl of FLIGHT_LIVE_SOURCES) {
+      try {
+        const res = await fetch(mkUrl(encodeURIComponent(cs)), fetchOpts());
+        if (!res.ok) continue;
+        const data = await res.json();
+        const ac = (data.ac || []).find((a) => Number.isFinite(a.lat) && Number.isFinite(a.lon));
+        if (ac) return ac;
+      } catch {
+        /* next source */
+      }
+    }
+  }
+  return null;
+}
+
+/** Put a live aircraft on the map, center on it and open its details. */
+function showAircraftOnMap(ac) {
+  state.aircraft.set(ac.hex, { ...ac, _seen: Date.now() });
+  map.setView([ac.lat, ac.lon], Math.max(map.getZoom(), 7));
+  selectAircraft(ac.hex);
+}
+
+function getAdbKey() {
+  return localStorage.getItem("adbKey") || "";
+}
+
+function fmtAdbStamp(t) {
+  // AeroDataBox time value: {local:"2026-08-02 07:40+02:00"} / {utc} / string
+  const s = (t && (t.local || t.utc)) || (typeof t === "string" ? t : null);
+  if (!s || s.length < 16) return { date: null, time: null };
+  return { date: s.slice(0, 10), time: s.slice(11, 16) };
+}
+
+function segTimes(seg) {
+  const sched = fmtAdbStamp(seg?.scheduledTime || seg?.scheduledTimeLocal);
+  const act = fmtAdbStamp(
+    seg?.actualTime || seg?.runwayTime || seg?.revisedTime || seg?.predictedTime || seg?.actualTimeLocal
+  );
+  return { sched, act };
+}
+
+const LIVE_STATUSES = new Set(["EnRoute", "Departed", "Approaching"]);
+
+async function fetchSchedule(number) {
+  const key = getAdbKey();
+  if (!key) return { needKey: true };
+
+  const headers = { "X-RapidAPI-Key": key, "X-RapidAPI-Host": "aerodatabox.p.rapidapi.com" };
+  const fmt = (d) => d.toISOString().slice(0, 10);
+  const now = Date.now();
+  const from = fmt(new Date(now - 3 * 864e5));
+  const to = fmt(new Date(now + 1 * 864e5));
+  const n = encodeURIComponent(number);
+
+  let flights = null;
+  try {
+    const res = await fetch(
+      `https://aerodatabox.p.rapidapi.com/flights/number/${n}/${from}/${to}?dateLocalRole=Both`,
+      { headers, ...fetchOpts() }
+    );
+    if (res.status === 401 || res.status === 403) {
+      return { error: "AeroDataBox rejected the API key — check the key and your (free) subscription on RapidAPI." };
+    }
+    if (res.ok) flights = await res.json();
+  } catch {
+    /* fall through to per-day */
+  }
+
+  if (!Array.isArray(flights)) {
+    flights = [];
+    for (let d = -3; d <= 1; d++) {
+      try {
+        const res = await fetch(
+          `https://aerodatabox.p.rapidapi.com/flights/number/${n}/${fmt(new Date(now + d * 864e5))}`,
+          { headers, ...fetchOpts() }
+        );
+        if (res.ok) {
+          const j = await res.json();
+          if (Array.isArray(j)) flights.push(...j);
+        }
+      } catch {
+        /* skip day */
+      }
+    }
+  }
+  return { rows: flights };
+}
+
+let currentFlight = null;
+
+async function searchFlight(query) {
+  const q = query.trim().toUpperCase().replace(/\s+/g, "");
+  if (!q) return;
+  ui.flightPanel.classList.remove("hidden");
+  ui.flightTitle.textContent = q;
+  ui.flightBody.innerHTML = `<p class="hint">Searching ${escapeHtml(q)}…</p>`;
+
+  // 1) resolve number/callsign + route via adsbdb
+  let fr = null;
+  try {
+    const res = await fetch(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(q)}`, fetchOpts());
+    if (res.ok) fr = (await res.json())?.response?.flightroute || null;
+  } catch {
+    /* keep nulls */
+  }
+
+  const flight = {
+    query: q,
+    csIcao: fr?.callsign_icao || null,
+    csIata: fr?.callsign_iata || null,
+    airline: fr?.airline?.name || null,
+    origin: normalizeAdsbdbAirport(fr?.origin),
+    dest: normalizeAdsbdbAirport(fr?.destination),
+    live: null,
+    schedule: null,
+  };
+  currentFlight = flight;
+
+  // 2) is it in the air right now, anywhere in the world?
+  flight.live = await findLiveByCallsign([flight.csIcao, q, flight.csIata]);
+  if (currentFlight === flight) renderFlightPanel();
+
+  // 3) multi-day schedule (needs AeroDataBox key)
+  flight.schedule = await fetchSchedule(flight.csIata || q);
+  if (currentFlight === flight) renderFlightPanel();
+}
+
+function renderFlightPanel() {
+  const f = currentFlight;
+  if (!f) return;
+  const title = [f.csIata, f.csIcao].filter(Boolean).join(" · ") || f.query;
+  ui.flightTitle.textContent = title;
+
+  let html = "";
+  if (f.airline) html += `<p class="flight-airline">${escapeHtml(f.airline)}</p>`;
+  if (f.origin && f.dest) {
+    html += `
+      <div class="route-box">
+        <div class="codes">${escapeHtml(f.origin.icao || f.origin.iata || "?")} → ${escapeHtml(f.dest.icao || f.dest.iata || "?")}</div>
+        <div>${escapeHtml(f.origin.name || "?")} → ${escapeHtml(f.dest.name || "?")}</div>
+      </div>`;
+  }
+
+  if (f.live) {
+    html += `
+      <div class="live-row">
+        <span class="badge-live">LIVE</span>
+        <span>${escapeHtml(fmtAlt(f.live))} · ${escapeHtml(fmtSpeed(f.live))}</span>
+        <button class="btn-mini" data-find-cs="${escapeHtml((f.live.flight || "").trim() || f.query)}">📍 Find on map</button>
+      </div>`;
+  } else {
+    html += `<p class="hint">Not airborne right now (or not receiving ADS-B).</p>`;
+  }
+
+  const s = f.schedule;
+  if (!s) {
+    html += `<p class="hint">Loading schedule…</p>`;
+  } else if (s.needKey) {
+    html += `
+      <div class="keyform">
+        <p class="hint">Multi-day schedules with planned/actual times need a free
+          <a href="https://rapidapi.com/aedbx-aedbx/api/aerodatabox" target="_blank" rel="noopener">AeroDataBox (RapidAPI)</a>
+          key. Paste it once — it is stored only in this browser.</p>
+        <input id="adb-key-input" type="password" placeholder="RapidAPI key" autocomplete="off" />
+        <button id="adb-key-save" class="btn-mini">Save key & load schedule</button>
+      </div>`;
+  } else if (s.error) {
+    html += `<p class="hint warn">${escapeHtml(s.error)}</p>`;
+  } else if (!s.rows?.length) {
+    html += `<p class="hint">No schedule entries found for the last 3 days through tomorrow.</p>`;
+  } else {
+    html += `<h3 class="sched-h">Flights (last 3 days → tomorrow)</h3>`;
+    const todayStr = new Date().toISOString().slice(0, 10);
+    for (const row of s.rows) {
+      const dep = segTimes(row.departure);
+      const arr = segTimes(row.arrival);
+      const date = dep.sched.date || dep.act.date || "?";
+      const dayLabel =
+        date === todayStr ? "Today" : date === new Date(Date.now() + 864e5).toISOString().slice(0, 10) ? "Tomorrow" : date;
+      const o = row.departure?.airport || {};
+      const d = row.arrival?.airport || {};
+      const live = LIVE_STATUSES.has(row.status);
+      html += `
+        <div class="flight-card${live ? " live" : ""}">
+          <div class="fc-top">
+            <b>${escapeHtml(dayLabel)}</b>
+            <span>${escapeHtml(o.iata || o.icao || "?")} → ${escapeHtml(d.iata || d.icao || "?")}</span>
+            <span class="fc-status">${escapeHtml(row.status || "")}</span>
+            ${live ? `<span class="badge-live">LIVE</span>
+              <button class="btn-mini" data-find-cs="${escapeHtml(row.callSign || f.csIcao || f.query)}">📍</button>` : ""}
+          </div>
+          <div class="fc-times">
+            <span>Dep ${escapeHtml(dep.sched.time || "—")}${dep.act.time ? ` <i>(act ${escapeHtml(dep.act.time)})</i>` : ""}</span>
+            <span>Arr ${escapeHtml(arr.sched.time || "—")}${arr.act.time ? ` <i>(act/est ${escapeHtml(arr.act.time)})</i>` : ""}</span>
+          </div>
+        </div>`;
+    }
+    html += `<p class="hint">Times are local to each airport. "act" = actual/estimated.</p>`;
+  }
+
+  ui.flightBody.innerHTML = html;
+
+  // wire dynamic buttons
+  ui.flightBody.querySelectorAll("[data-find-cs]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      setStatusNote(`Locating ${btn.dataset.findCs}…`);
+      const ac = await findLiveByCallsign([btn.dataset.findCs, currentFlight?.csIcao, currentFlight?.csIata]);
+      if (ac) {
+        setStatusNote(null);
+        showAircraftOnMap(ac);
+      } else {
+        setStatusNote(`${btn.dataset.findCs}: no live position found right now.`, true);
+      }
+    });
+  });
+  const keySave = ui.flightBody.querySelector("#adb-key-save");
+  if (keySave) {
+    keySave.addEventListener("click", async () => {
+      const val = ui.flightBody.querySelector("#adb-key-input").value.trim();
+      if (!val) return;
+      localStorage.setItem("adbKey", val);
+      const f2 = currentFlight;
+      f2.schedule = null;
+      renderFlightPanel();
+      f2.schedule = await fetchSchedule(f2.csIata || f2.query);
+      if (currentFlight === f2) renderFlightPanel();
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Events + boot
 // ---------------------------------------------------------------------------
 
@@ -1017,6 +1326,14 @@ ui.clearFilters.addEventListener("click", () => {
   render();
 });
 ui.detailClose.addEventListener("click", clearSelection);
+ui.flightSearchBtn.addEventListener("click", () => searchFlight(ui.flightSearch.value));
+ui.flightSearch.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") searchFlight(ui.flightSearch.value);
+});
+ui.flightClose.addEventListener("click", () => {
+  ui.flightPanel.classList.add("hidden");
+  currentFlight = null;
+});
 
 let moveTimer = null;
 map.on("moveend", () => {
