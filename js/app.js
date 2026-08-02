@@ -740,7 +740,52 @@ async function selectAircraft(hex) {
   const ac = state.aircraft.get(hex);
   if (ac && (!ac.t || !ac.r)) fetchAircraftInfo(hex); // enrich if provider lacks type data
   render();
+  ensureSelectedVisible();
   drawTrack(hex); // async: OpenSky first, session-trail fallback
+}
+
+/**
+ * The detail panel overlays part of the map (bottom sheet on phones, corner
+ * card on desktop) and can cover the plane that was just tapped. Pan the map
+ * so the selected plane sits in the unobscured area.
+ */
+function ensureSelectedVisible() {
+  // wait a frame so the freshly shown panel has been laid out and measurable
+  requestAnimationFrame(() => {
+    const ac = state.aircraft.get(state.selectedHex);
+    if (!ac || ui.detailPanel.classList.contains("hidden")) return;
+
+    const mapRect = map.getContainer().getBoundingClientRect();
+    const rect = ui.detailPanel.getBoundingClientRect();
+    const pt = map.latLngToContainerPoint([ac.lat, ac.lon]);
+    const margin = 40;
+
+    const px = pt.x + mapRect.left;
+    const py = pt.y + mapRect.top;
+    const covered =
+      px >= rect.left - margin &&
+      px <= rect.right + margin &&
+      py >= rect.top - margin &&
+      py <= rect.bottom + margin;
+    const offscreen =
+      pt.x < margin || pt.y < margin || pt.x > mapRect.width - margin || pt.y > mapRect.height - margin;
+    if (!covered && !offscreen) return;
+
+    // target point = middle of the free area next to / above the panel
+    const freeW = rect.left - mapRect.left; // column left of the panel
+    const freeH = rect.top - mapRect.top;   // row above the panel
+    let tx, ty;
+    if (rect.width >= mapRect.width * 0.85) {
+      // full-width bottom sheet: use the strip above it
+      tx = mapRect.width / 2;
+      ty = Math.max(60, freeH / 2);
+    } else {
+      // corner card: use the space to its left
+      tx = Math.max(80, freeW / 2);
+      ty = mapRect.height / 2;
+    }
+    map.panBy([pt.x - tx, pt.y - ty], { animate: true });
+  });
 }
 
 function clearSelection() {
