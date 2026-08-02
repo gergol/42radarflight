@@ -814,37 +814,70 @@ function parseTar1090Trace(data) {
   return points;
 }
 
+// tar1090 trace file layout used by most aggregator globes:
+//   /data/traces/<last two hex chars>/trace_full_<hex>.json  (since UTC midnight)
+const TRACE_SOURCES = [
+  {
+    name: "api.adsb.lol",
+    url: (hex) => `https://api.adsb.lol/v0/trace/${hex}`,
+  },
+  {
+    name: "globe.adsb.lol",
+    url: (hex) => `https://globe.adsb.lol/data/traces/${hex.slice(-2)}/trace_full_${hex}.json`,
+  },
+  {
+    name: "airplanes.live",
+    url: (hex) => `https://globe.airplanes.live/data/traces/${hex.slice(-2)}/trace_full_${hex}.json`,
+  },
+  {
+    name: "adsb.fi",
+    url: (hex) => `https://globe.adsb.fi/data/traces/${hex.slice(-2)}/trace_full_${hex}.json`,
+  },
+];
+
+let traceSourceIdx = 0; // sticks with the last trace source that worked
+
 async function fetchTrackPoints(hex) {
-  // 1) adsb.lol trace: full history since UTC midnight, includes altitude
-  try {
-    const res = await fetch(`https://api.adsb.lol/v0/trace/${hex.toLowerCase()}`, fetchOpts());
-    if (res.ok) {
+  const h = hex.toLowerCase();
+  const errors = [];
+
+  // 1) tar1090 trace files: full history since UTC midnight, with altitude
+  for (let i = 0; i < TRACE_SOURCES.length; i++) {
+    const idx = (traceSourceIdx + i) % TRACE_SOURCES.length;
+    const src = TRACE_SOURCES[idx];
+    try {
+      const res = await fetch(src.url(h), fetchOpts());
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const points = parseTar1090Trace(await res.json());
-      if (points.length >= 2) return { points, source: "adsb.lol flight history" };
+      if (points.length >= 2) {
+        traceSourceIdx = idx;
+        return { points, source: `${src.name} flight history`, errors };
+      }
+      errors.push(`${src.name}: empty trace`);
+    } catch (err) {
+      errors.push(`${src.name}: ${err.message || err.name || "failed"}`);
     }
-  } catch {
-    /* fall through */
   }
 
   // 2) OpenSky track-so-far (altitude in metres)
   try {
     const res = await fetch(
-      `https://opensky-network.org/api/tracks/all?icao24=${hex.toLowerCase()}&time=0`,
+      `https://opensky-network.org/api/tracks/all?icao24=${h}&time=0`,
       fetchOpts()
     );
-    if (res.ok) {
-      const data = await res.json();
-      const points = (data.path || [])
-        .filter((p) => Number.isFinite(p[1]) && Number.isFinite(p[2]))
-        .map((p) => ({
-          lat: p[1],
-          lon: p[2],
-          alt: Number.isFinite(p[3]) ? p[3] * 3.28084 : null,
-        }));
-      if (points.length >= 2) return { points, source: "OpenSky Network" };
-    }
-  } catch {
-    /* fall through */
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const points = (data.path || [])
+      .filter((p) => Number.isFinite(p[1]) && Number.isFinite(p[2]))
+      .map((p) => ({
+        lat: p[1],
+        lon: p[2],
+        alt: Number.isFinite(p[3]) ? p[3] * 3.28084 : null,
+      }));
+    if (points.length >= 2) return { points, source: "OpenSky Network", errors };
+    errors.push("OpenSky: empty track");
+  } catch (err) {
+    errors.push(`OpenSky: ${err.message || err.name || "failed"}`);
   }
 
   // 3) trail accumulated while this page has been open
@@ -852,21 +885,23 @@ async function fetchTrackPoints(hex) {
   if (trail.length >= 2) {
     return {
       points: trail.map((p) => ({ lat: p.lat, lon: p.lon, alt: p.alt })),
-      source: "this session only (history sources unavailable)",
+      source: "this session only",
+      errors,
     };
   }
-  return { points: [], source: null };
+  return { points: [], source: null, errors };
 }
 
 async function drawTrack(hex) {
   const token = ++trackFetchToken;
-  const { points, source } = await fetchTrackPoints(hex);
+  const { points, source, errors } = await fetchTrackPoints(hex);
   if (token !== trackFetchToken || hex !== state.selectedHex) return; // superseded
 
   trackState.hex = hex;
   trackState.fetchedAt = Date.now();
   trackState.points = points;
   trackState.source = source;
+  trackState.errors = errors;
   renderTrackLayers();
 }
 
@@ -924,10 +959,17 @@ function renderTrackLayers() {
 
   const note = document.getElementById("trail-note");
   if (note) {
-    note.textContent =
+    let text =
       trackState.points.length >= 2
         ? `Track: ${trackState.points.length} points — source: ${trackState.source}`
         : "No track available yet — it will build up as positions arrive.";
+    // when history had to be skipped, say why per source
+    const usingFallback =
+      trackState.points.length < 2 || trackState.source === "this session only";
+    if (usingFallback && trackState.errors?.length) {
+      text += ` — history unavailable: ${trackState.errors.join(" · ")}`;
+    }
+    note.textContent = text;
   }
 }
 
