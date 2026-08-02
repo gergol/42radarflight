@@ -816,7 +816,7 @@ function parseTar1090Trace(data) {
 
 // tar1090 trace file layout used by most aggregator globes:
 //   /data/traces/<last two hex chars>/trace_full_<hex>.json  (since UTC midnight)
-const TRACE_SOURCES = [
+const TRACE_BASES = [
   {
     name: "api.adsb.lol",
     url: (hex) => `https://api.adsb.lol/v0/trace/${hex}`,
@@ -834,6 +834,25 @@ const TRACE_SOURCES = [
     url: (hex) => `https://globe.adsb.fi/data/traces/${hex.slice(-2)}/trace_full_${hex}.json`,
   },
 ];
+
+// The globe servers don't send CORS headers, so direct browser fetches fail
+// with "Failed to fetch". Retry each source through public CORS proxies —
+// direct first, proxied only as fallback.
+const CORS_PROXIES = [
+  { suffix: "", wrap: (u) => u },
+  { suffix: " (via allorigins)", wrap: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
+  { suffix: " (via corsproxy)", wrap: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
+];
+
+const TRACE_SOURCES = [];
+for (const proxy of CORS_PROXIES) {
+  for (const base of TRACE_BASES) {
+    TRACE_SOURCES.push({
+      name: base.name + proxy.suffix,
+      url: (hex) => proxy.wrap(base.url(hex)),
+    });
+  }
+}
 
 let traceSourceIdx = 0; // sticks with the last trace source that worked
 
@@ -967,7 +986,9 @@ function renderTrackLayers() {
     const usingFallback =
       trackState.points.length < 2 || trackState.source === "this session only";
     if (usingFallback && trackState.errors?.length) {
-      text += ` — history unavailable: ${trackState.errors.join(" · ")}`;
+      const shown = trackState.errors.slice(0, 8);
+      const more = trackState.errors.length - shown.length;
+      text += ` — history unavailable: ${shown.join(" · ")}${more > 0 ? ` · +${more} more` : ""}`;
     }
     note.textContent = text;
   }
