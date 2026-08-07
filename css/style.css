@@ -131,6 +131,19 @@ html, body {
 
 .row-inline button:hover { filter: brightness(1.1); }
 
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  margin: 4px 0 10px;
+  cursor: pointer;
+}
+
+.check-row input { accent-color: var(--accent); width: 16px; height: 16px; }
+
+.hint-inline { font-size: 11px; color: var(--muted); }
+
 #clear-filters {
   background: var(--panel-2);
   border: 1px solid var(--border);

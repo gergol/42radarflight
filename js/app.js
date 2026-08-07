@@ -187,6 +187,7 @@ const ui = {
   limit: document.getElementById("limit-select"),
   filterAirport: document.getElementById("filter-airport"),
   filterRoute: document.getElementById("filter-route"),
+  filterMilitary: document.getElementById("filter-military"),
   clearFilters: document.getElementById("clear-filters"),
   status: document.getElementById("status"),
   planeList: document.getElementById("plane-list"),
@@ -416,19 +417,33 @@ const POSITION_PROVIDERS = [
   },
 ];
 
+// Global military-aircraft feeds (same tar1090 response shape, no bbox).
+const MIL_PROVIDERS = [
+  { name: "adsb.lol (mil)", fetch: () => fetchTar1090Style("https://api.adsb.lol/v2/mil") },
+  { name: "airplanes.live (mil)", fetch: () => fetchTar1090Style("https://api.airplanes.live/v2/mil") },
+  { name: "adsb.one (mil)", fetch: () => fetchTar1090Style("https://api.adsb.one/v2/mil") },
+  { name: "adsb.fi (mil)", fetch: () => fetchTar1090Style("https://opendata.adsb.fi/api/v2/mil") },
+];
+
 let providerIdx = 0; // sticks with the last provider that worked
+
+function militaryMode() {
+  return ui.filterMilitary.checked;
+}
 
 async function fetchAircraft() {
   const c = map.getCenter();
   const lat = c.lat.toFixed(4);
   const lon = c.lng.toFixed(4);
   const radius = viewRadiusNm();
+  const mil = militaryMode();
+  const providers = mil ? MIL_PROVIDERS : POSITION_PROVIDERS;
 
   let list = null;
   const errors = [];
-  for (let i = 0; i < POSITION_PROVIDERS.length; i++) {
-    const idx = (providerIdx + i) % POSITION_PROVIDERS.length;
-    const provider = POSITION_PROVIDERS[idx];
+  for (let i = 0; i < providers.length; i++) {
+    const idx = (providerIdx + i) % providers.length;
+    const provider = providers[idx];
     try {
       list = await provider.fetch(lat, lon, radius);
       providerIdx = idx;
@@ -451,7 +466,7 @@ async function fetchAircraft() {
 
   for (const ac of list) {
     if (!ac.hex) continue;
-    state.aircraft.set(ac.hex, { ...ac, _seen: now });
+    state.aircraft.set(ac.hex, { ...ac, _seen: now, _mil: mil || undefined });
 
     // accumulate session trail
     let trail = state.trails.get(ac.hex);
@@ -670,6 +685,10 @@ function visibleAircraft() {
 
   let list = [...state.aircraft.values()];
 
+  if (militaryMode()) {
+    list = list.filter((ac) => ac._mil || ((ac.dbFlags || 0) & 1));
+  }
+
   if (filtering) {
     list = list.filter((ac) => {
       const route = routeOf(ac);
@@ -785,7 +804,8 @@ function renderPlaneList(shown) {
 function renderStatus(shown) {
   const total = state.aircraft.size;
   const time = state.lastUpdate ? new Date(state.lastUpdate).toLocaleTimeString() : "—";
-  let html = `Showing <b>${shown.length}</b> of ${total} aircraft in range · updated ${time}`;
+  const scope = militaryMode() ? "military aircraft worldwide" : "aircraft in range";
+  let html = `Showing <b>${shown.length}</b> of ${total} ${scope} · updated ${time}`;
   if (state.dataSource) html += ` · via ${escapeHtml(state.dataSource)}`;
   if (state.fetchError) {
     html += `<br><span class="warn">All data sources failed — retrying…<br>${escapeHtml(
@@ -882,6 +902,7 @@ function renderDetail() {
     ["Squawk", ac.squawk || "—"],
     ["ICAO hex", ac.hex.toUpperCase()],
   ];
+  if (ac._mil || ((ac.dbFlags || 0) & 1)) items.push(["Military", "yes ✈"]);
   if (ac.desc) items.splice(1, 0, ["Type description", ac.desc]);
   if (ac.ownOp) items.push(["Operator", ac.ownOp]);
 
@@ -1452,8 +1473,25 @@ ui.filterRoute.addEventListener("input", render);
 ui.clearFilters.addEventListener("click", () => {
   ui.filterAirport.value = "";
   ui.filterRoute.value = "";
+  if (ui.filterMilitary.checked) {
+    ui.filterMilitary.checked = false;
+    switchAircraftMode();
+  }
   render();
 });
+ui.filterMilitary.addEventListener("change", switchAircraftMode);
+
+/** Civil <-> military feeds don't overlap; restart with a clean slate. */
+function switchAircraftMode() {
+  state.aircraft.clear();
+  state.trails.clear();
+  for (const marker of state.markers.values()) marker.remove();
+  state.markers.clear();
+  if (state.selectedHex) clearSelection();
+  providerIdx = 0;
+  render();
+  fetchAircraft();
+}
 ui.detailClose.addEventListener("click", clearSelection);
 
 function toggleFloatPanel(panel, btn) {
